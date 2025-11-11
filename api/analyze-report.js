@@ -1,26 +1,43 @@
 ﻿/**
- * api/analyze-report.js -- fail-safe debug handler for Vercel
- * - robust pdf-parse require
- * - extensive logging (console.log/console.error)
- * - never throws (always responds JSON)
+ * api/analyze-report.js -- module-load safe handler
+ * If pdf-parse fails to load during require(), this still starts and returns a JSON error.
+ * Replace current file with this exact content.
  */
-const multiparty = require('multiparty');
-const fs = require('fs');
+let multiparty;
+let fs;
+let pdfParse;
+let _pdfparse_load_error = null;
 
-// robust require for pdf-parse (works with different module shapes)
-const _pdfparse_lib = require('pdf-parse');
-const pdfParse = (typeof _pdfparse_lib === 'function')
-  ? _pdfparse_lib
-  : (_pdfparse_lib && (_pdfparse_lib.default || _pdfparse_lib).parse ? (_pdfparse_lib.default || _pdfparse_lib).parse : (_pdfparse_lib.default || _pdfparse_lib));
-
-console.log('analyze-report loaded, pdfParse type:', typeof pdfParse);
+try {
+  multiparty = require('multiparty');
+  fs = require('fs');
+  // attempt robust import of pdf-parse
+  const _pdf = require('pdf-parse');
+  pdfParse = (typeof _pdf === 'function')
+    ? _pdf
+    : (_pdf && (_pdf.default || _pdf).parse ? (_pdf.default || _pdf).parse : (_pdf.default || _pdf));
+} catch (e) {
+  // capture error but don't rethrow — allow module to load
+  _pdfparse_load_error = String(e);
+  // minimal fallbacks so code referencing multiparty/fs doesn't crash if missing
+  try { multiparty = multiparty || require('multiparty'); } catch (_) {}
+  try { fs = fs || require('fs'); } catch (_) {}
+  pdfParse = null;
+  console.error('module-load: pdf-parse require failed:', _pdfparse_load_error);
+  console.error('module-load stack (short):', (e && e.stack) ? e.stack.split("\\n").slice(0,4).join(" | ") : '');
+}
 
 module.exports = function (req, res) {
-  console.log('handler invoked, method=', req.method, 'url=', req.url);
+  // always log top-level entry
+  console.log('analyze-report handler entry; method=', req && req.method, 'url=', req && req.url, 'pdfParse-available=', !!pdfParse);
+
+  // CORS + preflight
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
   res.setHeader('Access-Control-Max-Age', '86400');
+
+  if (!req || !res) return;
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
@@ -29,7 +46,20 @@ module.exports = function (req, res) {
 
   if (req.method !== 'POST') {
     res.statusCode = 405;
-    return res.end(JSON.stringify({ ok:false, error:'Method Not Allowed' }));
+    res.end(JSON.stringify({ ok:false, error:'Method Not Allowed' }));
+    return;
+  }
+
+  // If pdf-parse failed to load at module time, return helpful JSON (no crash).
+  if (_pdfparse_load_error || !pdfParse) {
+    console.error('pdf-parse unavailable at runtime. module-load error:', _pdfparse_load_error);
+    res.statusCode = 500;
+    res.setHeader('Content-Type','application/json; charset=utf-8');
+    return res.end(JSON.stringify({
+      ok:false,
+      error:'pdf-parse not available in runtime',
+      details: _pdfparse_load_error || 'pdfParse === null'
+    }));
   }
 
   const form = new multiparty.Form({ maxFilesSize: 50 * 1024 * 1024 });
@@ -44,13 +74,13 @@ module.exports = function (req, res) {
 
       const fileArr = files?.file;
       if (!fileArr || !fileArr[0]) {
-        console.warn('no file uploaded in field "file" (fields keys):', Object.keys(fields || {}));
+        console.warn('no file uploaded in field "file"; fields keys:', Object.keys(fields || {}));
         res.statusCode = 400;
         return res.end(JSON.stringify({ ok:false, error:'no file uploaded (field must be named \"file\")' }));
       }
 
       const f = fileArr[0];
-      console.log('uploaded file info:', { fieldName: f.fieldName, originalFilename: f.originalFilename, path: f.path, size: f.size });
+      console.log('uploaded file:', { originalFilename: f.originalFilename, path: f.path, size: f.size });
 
       let buffer;
       try {
@@ -59,12 +89,6 @@ module.exports = function (req, res) {
         console.error('readFileSync error:', String(readErr));
         res.statusCode = 500;
         return res.end(JSON.stringify({ ok:false, error:'could not read uploaded file', details: String(readErr) }));
-      }
-
-      if (!pdfParse || typeof pdfParse !== 'function') {
-        console.error('pdfParse is not a function. typeof pdfParse=', typeof pdfParse, 'pdf-parse lib keys:', Object.keys(require('pdf-parse') || {}));
-        res.statusCode = 500;
-        return res.end(JSON.stringify({ ok:false, error:'pdf-parse not available in runtime', details: 'pdfParse is not a function' }));
       }
 
       let data;
@@ -76,25 +100,22 @@ module.exports = function (req, res) {
         return res.end(JSON.stringify({ ok:false, error:'pdfParse failed', details: String(parseErr) }));
       }
 
-      // success
       res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({
-        ok: true,
+      res.setHeader('Content-Type','application/json; charset=utf-8');
+      res.end(JSON.stringify({
+        ok:true,
         filename: f.originalFilename || null,
         length: buffer.length,
         pages: data.numpages || null,
         info: data.info || null,
-        text_snippet: (data.text || '').slice(0, 1000)
+        text_snippet: (data.text || '').slice(0,2000)
       }));
     } catch (outer) {
       console.error('unexpected handler error:', String(outer));
       res.statusCode = 500;
-      return res.end(JSON.stringify({ ok:false, error:'unexpected error', details: String(outer) }));
+      res.end(JSON.stringify({ ok:false, error:'unexpected error', details: String(outer) }));
     }
   });
 
-  req.on('error', e => {
-    console.error('req error event:', String(e));
-  });
+  req.on('error', e => console.error('req error event:', String(e)));
 };
