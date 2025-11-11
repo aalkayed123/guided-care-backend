@@ -17,5 +17,9 @@
   "bugs": {
     "url": "https://github.com/aalkayed123/guided-care-backend/issues"
   },
-  "homepage": "https://github.com/aalkayed123/guided-care-backend#readme"
+  "homepage": "https://github.com/aalkayed123/guided-care-backend#readme",
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "pdf-parse": "^2.4.5"
+  }
 }
