@@ -1,0 +1,6 @@
+﻿
+Path                                                             LineNumber Line                    
+----                                                             ---------- ----                    
+C:\Users\Admin\Desktop\guided-care-backend\api\trpc\[...trpc].js          1 // api/trpc/[...trpc].js
+
+
