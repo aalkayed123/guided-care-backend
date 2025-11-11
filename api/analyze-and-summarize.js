@@ -120,21 +120,34 @@ module.exports = function (req, res) {
 
       const rawText = (data.text || '').trim();
       // Build extraction prompt (conservative length)
-      const prompt = `You are a careful medical-report extractor. 
-Input: a medical report as plain text below. Extract the following fields and return valid JSON and nothing else:
-{
-  "patient_name": string or null,
-  "patient_id": string or null,
-  "age_gender": string or null,
-  "study": string or null,           // e.g., "Dorsal spine MRI with contrast"
-  "findings": string or null,
-  "impression": string or null,
-  "recommendations": string or null,
-  "important_numbers": { "WBC": number|null, "Hb": number|null, "other_lab_values": { "<name>": "<value>" } },
-  "confidence_notes": string or null
-}
-If a field can't be found, set it to null. Keep strings short but informative. Only output JSON. Report text:
-\"\"\"${rawText.slice(0, 24000)}\"\"\"`;
+      const prompt = `You are a medical-report extraction assistant.
+INPUT: a radiology/pathology/clinical REPORT. OUTPUT: strictly valid JSON only (no commentary, no surrounding text, no markdown).
+
+Return EXACTLY one JSON object with the following keys (use null when information is missing):
+- patient_name (string|null)
+- patient_id (string|null)
+- age_gender (string|null)
+- study (string|null)           // e.g., "DORSAL SPINE MRI WITH CONTRAST"
+- findings (string|null)        // concise sentence(s)
+- impression (string|null)      // concise
+- recommended_next_steps (string|null) // concrete next steps: e.g. "urgent neurosurgery referral within 48 hrs", "schedule outpatient neurosurgery", "conservative management and follow-up 6 weeks"
+- triage_urgency (one of: "emergent", "urgent (<72h)", "soon (1-2 weeks)", "routine", null)
+- specialty_referral (string|null) // e.g., "Neurosurgery", "Orthopedics", "Neurology"
+- important_numbers (object) { WBC, Hb, platelets, other_lab_values: {} } // use nulls or empty object if none
+- clinician_summary (string|null) // 1-2 sentence plain-language summary for the treating clinician
+- confidence_notes (string|null) // short note if uncertain (e.g., 'report truncated', 'inference: likely meningioma')
+
+IMPORTANT:
+1) Return STRICT valid JSON only. Nothing else.
+2) For recommended_next_steps, infer reasonable actionable next steps even if not explicitly stated.
+3) If there is cord compression or severe spinal canal compromise, set triage_urgency to 'urgent (<72h)' or 'emergent' as appropriate.
+4) Keep values concise.
+5) Put clinical inferences in clinician_summary and mention uncertainty in confidence_notes.
+
+REPORT_TEXT:
+\"\"\"${rawText.slice(0,24000)}\"\"\"
+`;
+
 
       // Call OpenAI
       let aiResult;
