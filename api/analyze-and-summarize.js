@@ -1,190 +1,207 @@
-// api/analyze-and-summarize.js
-// Drop-in Vercel / Node handler:
-// 1) accepts multipart (field name "file")
-// 2) extracts text with pdf-parse
-// 3) sends a prompt to OpenAI to extract structured JSON fields
-// 4) returns JSON { ok, extracted: {...}, ai_raw: "...", raw_text: "..." }
-//
-// Requirements:
-// - Install pdf-parse & multiparty in package.json (you already have them).
-// - Set OPENAI_API_KEY in environment (Vercel: Project > Settings > Environment Variables).
-//
-// IMPORTANT: This sends PDF text to OpenAI — ensure you have necessary consent for PHI.
+import { z } from "zod";
+import { publicProcedure } from "../../../create-context";
+import { generateText } from "@rork-ai/toolkit-sdk";
 
-let multiparty, fs, pdfParse;
-let _pdfloadError = null;
-try {
-  multiparty = require('multiparty');
-  fs = require('fs');
-  const _pdf = require('pdf-parse');
-  pdfParse = (typeof _pdf === 'function') ? _pdf
-    : (_pdf && (_pdf.default || _pdf).parse ? (_pdf.default || _pdf).parse : (_pdf.default || _pdf));
-} catch (e) {
-  _pdfloadError = String(e);
-  try { multiparty = multiparty || require('multiparty'); } catch (_) {}
-  try { fs = fs || require('fs'); } catch (_) {}
-  pdfParse = null;
-  console.error('pdf-parse load error:', _pdfloadError);
-}
+const analyzeLabReportInputSchema = z.object({
+  imageBase64: z.string().describe("Base64 encoded image or PDF"),
+  mimeType: z.string().describe("MIME type of the file"),
+  language: z.string().optional().describe("Preferred language for response (en/ar)"),
+});
 
-const OPENAI_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY?.trim();
+type AnalysisResult = {
+  patient_name?: string;
+  age_gender?: string;
+  study?: string;
+  summary_for_patient: string;
+  impression: string;
+  findings: string;
+  recommended_next_steps: string;
+  specialty_referral?: string;
+  triage_urgency: "low" | "medium" | "high" | "normal";
+} | {
+  error: string;
+};
 
-async function callOpenAI(prompt) {
-  if (!OPENAI_KEY) throw new Error('Missing OPENAI_API_KEY environment variable');
+export const analyzeLabReportProcedure = publicProcedure
+  .input(analyzeLabReportInputSchema)
+  .mutation(async ({ input, ctx }) => {
+    console.log("\n\n🔬 ========== LAB REPORT ANALYSIS START ==========");
+    console.log("⏰ Timestamp:", new Date().toISOString());
+    console.log("📊 Input received:", !!input);
+    console.log("📊 Input keys:", input ? Object.keys(input) : "undefined");
+    
+    if (!input) {
+      console.error("❌ Input is undefined!");
+      return {
+        error: "Invalid request: input is undefined",
+        confidence: 0,
+      };
+    }
+    
+    if (!input.imageBase64) {
+      console.error("❌ imageBase64 is missing!");
+      return {
+        error: "Invalid request: image data is missing",
+        confidence: 0,
+      };
+    }
+    
+    console.log("📊 File received ✅");
+    console.log("📏 File size:", (input.imageBase64.length / 1024).toFixed(2), "KB");
+    console.log("📝 MIME type:", input.mimeType);
+    console.log("🌍 Language:", input.language || "en");
 
-  // Use fetch (available in Node 18+ / Node 24)
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',        // change if needed
-      messages: [
-        { role: 'system', content: 'You are a strict JSON-only extractor. Return valid JSON only.' },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0.0,
-      max_tokens: 1000
-    })
-  });
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        console.error("⏰ TIMEOUT: Analysis exceeded 5 minutes");
+        reject(new Error("Analysis timeout after 5 minutes"));
+      }, 300000);
+    });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`OpenAI API error ${res.status}: ${txt}`);
-  }
-
-  const j = await res.json();
-  // Extract assistant text (handle multiple choices)
-  const assistantText = j?.choices?.[0]?.message?.content ?? '';
-  return { assistantText, rawResponse: j };
-}
-
-module.exports = function (req, res) {
-  // CORS + preflight
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Max-Age', '86400');
-
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204;
-    return res.end();
-  }
-  if (req.method !== 'POST') {
-    res.statusCode = 405;
-    return res.end(JSON.stringify({ ok: false, error: 'Method Not Allowed' }));
-  }
-
-  // If pdf-parse didn't load, return helpful error
-  if (_pdfloadError || !pdfParse) {
-    console.error('pdf-parse unavailable:', _pdfloadError);
-    res.statusCode = 500;
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    return res.end(JSON.stringify({ ok: false, error: 'pdf-parse not available', details: _pdfloadError || 'pdfParse === null' }));
-  }
-
-  const form = new multiparty.Form({ maxFilesSize: 80 * 1024 * 1024 });
-
-  form.parse(req, async (err, fields, files) => {
     try {
-      if (err) {
-        console.error('multipart parse error:', String(err));
-        res.statusCode = 500;
-        return res.end(JSON.stringify({ ok: false, error: 'multipart parse error', details: String(err) }));
-      }
+      const analysisPromise = (async () => {
+        console.log("\n📋 STEP 1: Preparing prompt...");
+        
+        let extractedText = "";
+        
+        if (input.mimeType.includes("pdf")) {
+          console.log("📌 PDF detected — extracting text from PDF...");
+          try {
+            const pdfjs = await import('pdfjs-dist');
+            
+            const pdfData = Buffer.from(input.imageBase64, 'base64');
+            const loadingTask = pdfjs.getDocument({ data: pdfData });
+            const pdf = await loadingTask.promise;
+            
+            console.log(`📄 PDF has ${pdf.numPages} pages`);
+            
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+              const page = await pdf.getPage(pageNum);
+              const textContent = await page.getTextContent();
+              const pageText = textContent.items.map((item: any) => item.str).join(' ');
+              extractedText += pageText + '\n';
+              console.log(`✅ Extracted text from page ${pageNum}: ${pageText.length} chars`);
+            }
+            
+            console.log(`✅ Total extracted text: ${extractedText.length} characters`);
+            console.log(`📄 First 500 characters: ${extractedText.substring(0, 500)}`);
+          } catch (error) {
+            console.error("❌ Failed to extract text from PDF:", error);
+            console.log("⚠️ Falling back to vision-based analysis...");
+            extractedText = "";
+          }
+        }
+        
+        const languageInstruction = input.language === "ar" ? "Respond in Arabic." : "Respond in English.";
+        
+        const basePrompt = `You are Cureon AI. Your job is to explain ANY medical report in clear, simple, non-repetitive language.
 
-      const fileArr = files?.file;
-      if (!fileArr || !fileArr[0]) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ ok: false, error: 'no file uploaded (field must be named "file")' }));
-      }
+You must return ONLY the JSON fields below. No extra text. No section titles or labels inside the text content. Never repeat the same sentence in more than one field.
 
-      const f = fileArr[0];
-      let buffer;
-      try { buffer = fs.readFileSync(f.path); } catch (readErr) {
-        console.error('readFileSync error:', String(readErr));
-        res.statusCode = 500;
-        return res.end(JSON.stringify({ ok: false, error: 'could not read uploaded file', details: String(readErr) }));
-      }
+FIELDS:
 
-      let data;
-      try {
-        data = await pdfParse(buffer);
-      } catch (parseErr) {
-        console.error('pdfParse failed:', String(parseErr));
-        res.statusCode = 500;
-        return res.end(JSON.stringify({ ok: false, error: 'pdfParse failed', details: String(parseErr) }));
-      }
+1) "patient_name": If present in the report, extract it. If not, write "Unknown".
 
-      const rawText = (data.text || '').trim();
-      // Build extraction prompt (conservative length)
-      const prompt = `You are a medical-report extraction assistant.
-INPUT: a radiology/pathology/clinical REPORT. OUTPUT: strictly valid JSON only (no commentary, no surrounding text, no markdown).
+2) "age_gender": Extract age & gender. If missing, write "Unknown".
 
-Return EXACTLY one JSON object with the following keys (use null when information is missing):
-- patient_name (string|null)
-- patient_id (string|null)
-- age_gender (string|null)
-- study (string|null)           // e.g., "DORSAL SPINE MRI WITH CONTRAST"
-- findings (string|null)        // concise sentence(s)
-- impression (string|null)      // concise
-- recommended_next_steps (string|null) // concrete next steps: e.g. "urgent neurosurgery referral within 48 hrs", "schedule outpatient neurosurgery", "conservative management and follow-up 6 weeks"
-- triage_urgency (one of: "emergent", "urgent (<72h)", "soon (1-2 weeks)", "routine", null)
-- specialty_referral (string|null) // e.g., "Neurosurgery", "Orthopedics", "Neurology"
-- important_numbers (object) { WBC, Hb, platelets, other_lab_values: {} } // use nulls or empty object if none
-- clinician_summary (string|null) // 1-2 sentence plain-language summary for the treating clinician
-- confidence_notes (string|null) // short note if uncertain (e.g., 'report truncated', 'inference: likely meningioma')
+3) "study": Type of report (e.g., CBC, urine test, NIPT, imaging).
 
-IMPORTANT:
-1) Return STRICT valid JSON only. Nothing else.
-2) For recommended_next_steps, infer reasonable actionable next steps even if not explicitly stated.
-3) If there is cord compression or severe spinal canal compromise, set triage_urgency to 'urgent (<72h)' or 'emergent' as appropriate.
-4) Keep values concise.
-5) Put clinical inferences in clinician_summary and mention uncertainty in confidence_notes.
+4) "summary_for_patient":
+   - Write 2-3 sentences about the overall situation in PLAIN ENGLISH.
+   - Talk about what the results mean for how the patient feels or what might happen.
+   - Use ONLY everyday words. Zero medical terminology. Zero test names.
+   - Example for low iron: "Your child's blood test shows a few small changes that can happen with low iron or allergies. Nothing dangerous, but it should be checked."
+   - MUST be completely different from "impression".
 
-REPORT_TEXT:
-\"\"\"${rawText.slice(0,24000)}\"\"\"
-`;
+5) "impression":
+   - Explain what the medical terms mean.
+   - MUST quote at least 2 actual medical terms from the report in quotes.
+   - Format: • "Medical Term" means [explanation in simple words]
+   - Example: • "Anemia" means the body may have fewer or smaller red blood cells than usual.
+              • "Eosinophilia" means a rise in allergy-related white blood cells.
+   - Add a short summary sentence at the end if helpful.
+   - MUST be completely different from "summary_for_patient".
 
+6) "findings":
+   - Bullet points of specific things that are abnormal or need attention.
+   - Use bullet format: • Point 1\n• Point 2\n• Point 3
+   - Keep each point short (under 12 words).
+   - Different from impression and summary.
 
-      // Call OpenAI
-      let aiResult;
-      try {
-        aiResult = await callOpenAI(prompt);
-      } catch (aiErr) {
-        console.error('OpenAI call failed:', String(aiErr));
-        res.statusCode = 500;
-        return res.end(JSON.stringify({ ok: false, error: 'OpenAI call failed', details: String(aiErr) }));
-      }
+7) "recommended_next_steps":
+   - What should the patient do next?
+   - Which type of doctor to see (if needed) and why.
+   - Write as a short paragraph or 2-3 bullets.
+   - No repetition from other fields.
 
-      // Try to parse assistant JSON; if parse fails return raw assistant text
-      let parsed = null;
-      try {
-        parsed = JSON.parse(aiResult.assistantText);
-      } catch (jsonErr) {
-        parsed = null;
-        console.warn('Failed to parse AI JSON. Returning raw assistant text instead.');
-      }
+8) "specialty_referral": One specialty only (e.g., "Pediatric Hematologist").
 
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({
-        ok: true,
-        filename: f.originalFilename || null,
-        length: buffer.length,
-        pages: data.numpages || null,
-        info: data.info || null,
-        raw_text: rawText,
-        ai_raw: aiResult.assistantText,
-        ai_response_full: aiResult.rawResponse,
-        extracted: parsed
-      }));
-    } catch (outer) {
-      console.error('unexpected handler error:', String(outer));
-      res.statusCode = 500;
-      return res.end(JSON.stringify({ ok: false, error: 'unexpected error', details: String(outer) }));
+9) "triage_urgency": one of ["normal", "low", "medium", "high"].
+
+CRITICAL RULES:
+- Every field must have UNIQUE content. Zero overlap.
+- Do NOT add section labels like "Explanation of medical terms:" or "Key findings:" inside the content.
+- Do NOT reuse the same sentence or phrase across fields.
+- "summary_for_patient" = layperson feelings/outcome, zero medical words.
+- "impression" = medical terms explained in simple language.
+- "findings" = specific abnormal values, short bullets.
+- "recommended_next_steps" = actionable advice.
+
+Return your response ONLY as valid JSON in this exact structure:
+
+{
+  "patient_name": "",
+  "age_gender": "",
+  "study": "",
+  "summary_for_patient": "",
+  "impression": "",
+  "findings": "",
+  "recommended_next_steps": "",
+  "specialty_referral": "",
+  "triage_urgency": ""
+}
+
+${languageInstruction}`;
+        
+        let userContentParts = [];
+        
+        if (extractedText.length > 50) {
+          userContentParts.push({ type: "text", text: basePrompt + "\n\nExtracted text from report:\n" + extractedText.substring(0, 4000) });
+        } else {
+          const base64Data = input.imageBase64.includes('base64,')
+            ? input.imageBase64
+            : `data:${input.mimeType};base64,${input.imageBase64}`;
+          userContentParts.push({ type: "text", text: basePrompt });
+          userContentParts.push({ type: "image", image: base64Data });
+        }
+        
+        const response = await generateText({
+          messages: [
+            {
+              role: "user",
+              content: userContentParts,
+            },
+          ],
+        });
+
+        const jsonMatch = response.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+          return {
+            error: "Could not read file. Try another report.",
+            confidence: 0,
+          };
+        }
+
+        const result = JSON.parse(jsonMatch[0]) as AnalysisResult;
+        return result;
+      })();
+
+      return await Promise.race([analysisPromise, timeoutPromise]);
+
+    } catch (error) {
+      return {
+        error: "Could not read file. Try another report.",
+        confidence: 0,
+      };
     }
   });
-};
